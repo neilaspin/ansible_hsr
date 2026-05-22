@@ -1,0 +1,142 @@
+---
+- name: Enable HSR on primary
+  hosts: primary
+  become: true
+  gather_facts: true
+
+  vars:
+    hana_sid: "HDB"
+    hana_instance: "00"
+    hana_master_pw: "<your-hana-master-password>"
+    hsr_replication_mode: "syncmem"
+    hsr_operation_mode: "logreplay"
+    hsr_site_name_primary: "SITE1"
+    hsr_site_name_secondary: "SITE2"
+    secondary_private_hostname: "hana-secondary.hana.internal"
+
+  tasks:
+
+    - name: Run HANA data backup (required before enabling HSR)
+      shell: |
+        su - {{ hana_sid | lower }}adm -c "
+          hdbsql -i {{ hana_instance }} -u SYSTEM -p '{{ hana_master_pw }}' \
+          \"BACKUP DATA USING FILE ('initial_backup')\"
+        "
+      register: backup_result
+      changed_when: true
+
+    - name: Show backup result
+      debug:
+        msg: "{{ backup_result.stdout_lines }}"
+
+    - name: Enable system replication on primary
+      shell: |
+        su - {{ hana_sid | lower }}adm -c "
+          hdbnsutil -sr_enable --name={{ hsr_site_name_primary }}
+        "
+      register: sr_enable
+      changed_when: true
+
+    - name: Confirm HSR enabled on primary
+      shell: |
+        su - {{ hana_sid | lower }}adm -c "hdbnsutil -sr_state"
+      register: sr_state_primary
+      changed_when: false
+
+    - name: Show primary HSR state
+      debug:
+        msg: "{{ sr_state_primary.stdout_lines }}"
+
+    - name: Fail if primary not in HSR primary mode
+      fail:
+        msg: "Primary HSR enable failed — check hdbnsutil -sr_state output above"
+      when: "'mode: primary' not in sr_state_primary.stdout"
+
+
+- name: Register secondary and start replication
+  hosts: secondary
+  become: true
+  gather_facts: true
+
+  vars:
+    hana_sid: "HDB"
+    hana_instance: "00"
+    hana_master_pw: "<your-hana-master-password>"
+    hsr_replication_mode: "syncmem"
+    hsr_operation_mode: "logreplay"
+    hsr_site_name_secondary: "SITE2"
+    primary_private_hostname: "hana-primary.hana.internal"
+
+  tasks:
+
+    - name: Stop HANA on secondary
+      shell: |
+        su - {{ hana_sid | lower }}adm -c "HDB stop"
+      register: hdb_stop
+      changed_when: true
+
+    - name: Wait for HANA to fully stop
+      shell: |
+        su - {{ hana_sid | lower }}adm -c "HDB info" 2>&1 | grep -c hdbdaemon || true
+      register: stop_check
+      until: stop_check.stdout | int == 0
+      retries: 20
+      delay: 15
+      changed_when: false
+
+    - name: Register secondary with primary
+      shell: |
+        su - {{ hana_sid | lower }}adm -c "
+          hdbnsutil -sr_register \
+            --name={{ hsr_site_name_secondary }} \
+            --remoteHost={{ primary_private_hostname }} \
+            --remoteInstance={{ hana_instance }} \
+            --replicationMode={{ hsr_replication_mode }} \
+            --operationMode={{ hsr_operation_mode }}
+        "
+      register: sr_register
+      changed_when: true
+
+    - name: Show registration output
+      debug:
+        msg: "{{ sr_register.stdout_lines }}"
+
+    - name: Start HANA on secondary (replication initialises on startup)
+      shell: |
+        su - {{ hana_sid | lower }}adm -c "HDB start"
+      register: hdb_start
+      changed_when: true
+      async: 600
+      poll: 30
+
+
+- name: Verify replication state from primary
+  hosts: primary
+  become: true
+  gather_facts: false
+
+  vars:
+    hana_sid: "HDB"
+    hana_instance: "00"
+
+  tasks:
+
+    - name: Wait for secondary to connect (allow up to 5 minutes)
+      shell: |
+        su - {{ hana_sid | lower }}adm -c "
+          python3 /usr/sap/{{ hana_sid }}/{{ hana_sid }}{{ hana_instance }}/exe/python_support/systemReplicationStatus.py
+        " 2>&1 || true
+      register: hsr_status
+      until: "'ACTIVE' in hsr_status.stdout or 'SYNCING' in hsr_status.stdout"
+      retries: 20
+      delay: 15
+      changed_when: false
+
+    - name: Show replication status
+      debug:
+        msg: "{{ hsr_status.stdout_lines }}"
+
+    - name: Confirm replication is active
+      fail:
+        msg: "HSR did not reach ACTIVE or SYNCING state — check systemReplicationStatus.py output above"
+      when: "'ACTIVE' not in hsr_status.stdout and 'SYNCING' not in hsr_status.stdout"
